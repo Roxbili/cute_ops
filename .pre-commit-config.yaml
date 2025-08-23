@@ -1,0 +1,34 @@
+repos:
+  # ---------------------- General file checks ----------------------
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.5.0
+    hooks:
+      - id: check-yaml                # Validate YAML file syntax
+      - id: check-toml                # Validate TOML file syntax
+      - id: check-added-large-files   # Prevent committing large files
+      - id: check-merge-conflict      # Prevent committing merge conflict markers
+      - id: end-of-file-fixer         # Ensure file ends with a newline
+      - id: trailing-whitespace       # Remove trailing whitespace
+
+  # ---------------------- Spell check ----------------------
+  - repo: https://github.com/codespell-project/codespell
+    rev: v2.2.6
+    hooks:
+      - id: codespell
+        args: ["--skip=.git,build"]
+
+  # ---------------------- Python: Ruff lint & format ----------------------
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.3.5
+    hooks:
+      - id: ruff
+        args: [--fix]  # Auto-fix lint issues
+      - id: ruff-format  # Format Python code (similar to black)
+
+  # ---------------------- C++/CUDA: Clang-Format ----------------------
+  - repo: https://github.com/pre-commit/mirrors-clang-format
+    rev: v17.0.6
+    hooks:
+      - id: clang-format
+        files: "\\.(c|cc|cpp|cu|cuh|h|hpp|hxx|inl|proto)$"
+        args: ["--style=file"]  # Use style defined in .clang-format

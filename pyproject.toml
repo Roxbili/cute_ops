@@ -1,0 +1,26 @@
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+ignore = ["E501"]  # Let formatter handle long lines
+exclude = [
+    ".git",
+    "__pycache__",
+    "build",
+    "dist",
+    ".venv",
+    "venv"
+]
+
+[tool.ruff.lint.isort]
+combine-as-imports = true
+known-first-party = ["your_project"]
+order-by-type = false
+
+[tool.ruff.lint.pyupgrade]
+keep-runtime-typing = true
+
+[tool.codespell]
+skip = ".git,build,dist,*.svg,*.json"

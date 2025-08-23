@@ -1,0 +1,12 @@
+BasedOnStyle: Google
+IndentWidth: 2
+ColumnLimit: 100
+UseTab: Never
+AllowShortFunctionsOnASingleLine: Empty
+SortIncludes: true
+AlignConsecutiveAssignments: true
+AlignConsecutiveDeclarations: true
+AccessModifierOffset: -2
+BreakBeforeBraces: Allman
+DerivePointerAlignment: false
+PointerAlignment: Left
