@@ -4,6 +4,8 @@ import cutlass.cute.testing as testing
 import torch
 from cutlass.cute.runtime import from_dlpack
 
+# from cute_ops.utils import print_coords, print_tensor_or_layout_info
+
 
 @cute.kernel
 def elementwise_add_naive_kernel(
@@ -174,6 +176,86 @@ def run_elementwise_add_tv_layout():
 
 
 @cute.kernel
+def elementwise_add_tv_layout_atom_kernel(
+    gA: cute.Tensor,
+    gB: cute.Tensor,
+    gC: cute.Tensor,
+    tv_layout: cute.Layout,
+):
+    tidx, _, _ = cute.arch.thread_idx()
+    bidx, _, _ = cute.arch.block_idx()
+
+    blk_coord = ((None, None), bidx)
+    blkA = gA[blk_coord]
+    blkB = gB[blk_coord]
+    blkC = gC[blk_coord]
+
+    copy_atom_load = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), gA.element_type)
+    copy_atom_store = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), gC.element_type)
+
+    tiled_A = cute.composition(blkA, tv_layout)
+    tiled_B = cute.composition(blkB, tv_layout)
+    tiled_C = cute.composition(blkC, tv_layout)
+
+    thr_coord = (tidx, (None, None))
+    thrA = tiled_A[thr_coord]
+    thrB = tiled_B[thr_coord]
+    thrC = tiled_C[thr_coord]
+
+    frgA = cute.make_fragment_like(thrA)
+    frgB = cute.make_fragment_like(thrB)
+    frgC = cute.make_fragment_like(thrC)
+
+    cute.copy(copy_atom_load, thrA, frgA)
+    cute.copy(copy_atom_load, thrB, frgB)
+
+    result = frgA.load() + frgB.load()
+    frgC.store(result)
+    cute.copy(copy_atom_store, frgC, thrC)
+
+
+@cute.jit
+def elementwise_add_tv_layout_atom(mA, mB, mC, copy_bits: cutlass.Constexpr = 128):
+    vector_size = copy_bits // mA.element_type.width
+
+    thr_layout = cute.make_ordered_layout((4, 32), order=(1, 0))
+    value_layout = cute.make_ordered_layout((4, vector_size), order=(1, 0))
+    tile_mn, tv_layout = cute.make_layout_tv(thr_layout, value_layout)
+
+    # print_tensor_or_layout_info("thr_layout", thr_layout)
+    # print_tensor_or_layout_info("value_layout", value_layout)
+    # print_tensor_or_layout_info("tile_mn", tile_mn)
+    # print_tensor_or_layout_info("tv_layout", tv_layout)
+    # - thr_layout: Layout(shape=(4, 32), stride=(32, 1))
+    # - value_layout: Layout(shape=(4, 4), stride=(4, 1))
+    # - tile_mn: Unknown type <class 'tuple'> (16, 128)
+    # - tv_layout: Layout(shape=((32, 4), (4, 4)), stride=((64, 4), (16, 1)))
+
+    gA = cute.zipped_divide(mA, tile_mn)  # ((TileM,TileN),(RestM,RestN))
+    gB = cute.zipped_divide(mB, tile_mn)  # ((TileM,TileN),(RestM,RestN))
+    gC = cute.zipped_divide(mC, tile_mn)  # ((TileM,TileN),(RestM,RestN))
+
+    grid = (cute.size(gC, mode=[1]), 1, 1)
+    block = (cute.size(tv_layout, mode=[0]), 1, 1)
+    elementwise_add_tv_layout_atom_kernel(gA, gB, gC, tv_layout).launch(grid=grid, block=block)
+
+
+def run_elementwise_add_tv_layout_atom():
+    M, N = 1024, 1024
+
+    A = torch.rand((M, N), device="cuda", dtype=torch.float32)
+    B = torch.rand((M, N), device="cuda", dtype=torch.float32)
+    C = torch.zeros((M, N), device="cuda", dtype=torch.float32)
+
+    mA = from_dlpack(A)
+    mB = from_dlpack(B)
+    mC = from_dlpack(C)
+
+    cute.compile(elementwise_add_tv_layout_atom, mA, mB, mC)(mA, mB, mC)
+    torch.testing.assert_close(A + B, C, rtol=1e-3, atol=1e-3)
+
+
+@cute.kernel
 def elementwise_add_copy_atom_kernel(
     gA: cute.Tensor,
     gB: cute.Tensor,
@@ -276,6 +358,7 @@ def benchmark():
         elementwise_add_naive,
         elementwise_add_vectorize_load,
         elementwise_add_tv_layout,
+        elementwise_add_tv_layout_atom,
         elementwise_add_copy_atom,
     ]:
         # start = time.time()
@@ -298,5 +381,6 @@ if __name__ == "__main__":
     # run_elementwise_add_naive()
     # run_elementwise_add_vectorize_load()
     # run_elementwise_add_tv_layout()
+    # run_elementwise_add_tv_layout_atom()
     # run_elementwise_add_copy_atom()
     benchmark()

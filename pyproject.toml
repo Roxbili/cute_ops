@@ -13,6 +13,9 @@ exclude = [
     ".venv",
     "venv"
 ]
+fixable = [
+    "F401",
+]
 
 [tool.ruff.lint.isort]
 combine-as-imports = true
