@@ -398,24 +398,24 @@ class SGemm:
             cutlass.Boolean,
         )
         # Set predicates for m/n bounds for mainloop
-        for rest_v in range(tApA.shape[0]):
-            for m in range(tApA.shape[1]):
+        for rest_v in range(tApA.shape[0], unroll_full=True):
+            for m in range(tApA.shape[1], unroll_full=True):
                 tApA[rest_v, m, 0] = cute.elem_less(tAcA[(0, rest_v), m, 0, 0][0], mA.shape[0])
-        for rest_v in range(tBpB.shape[0]):
-            for n in range(tBpB.shape[1]):
+        for rest_v in range(tBpB.shape[0], unroll_full=True):
+            for n in range(tBpB.shape[1], unroll_full=True):
                 tBpB[rest_v, n, 0] = cute.elem_less(tBcB[(0, rest_v), n, 0, 0][0], mB.shape[0])
 
         # Set predicates for m/n/k bounds for residue k tile
-        for rest_v in range(tApA_residue_k.shape[0]):
-            for m in range(tApA_residue_k.shape[1]):
-                for k in range(tApA_residue_k.shape[2]):
+        for rest_v in range(tApA_residue_k.shape[0], unroll_full=True):
+            for m in range(tApA_residue_k.shape[1], unroll_full=True):
+                for k in range(tApA_residue_k.shape[2], unroll_full=True):
                     coord_A = tAcA[(0, rest_v), m, k, 0]
                     tApA_residue_k[rest_v, m, k] = cute.elem_less(
                         (coord_A[0], cutlass.Int32(-1)), (mA.shape[0], coord_A[1])
                     )
-        for rest_v in range(tBpB_residue_k.shape[0]):
-            for n in range(tBpB_residue_k.shape[1]):
-                for k in range(tBpB_residue_k.shape[2]):
+        for rest_v in range(tBpB_residue_k.shape[0], unroll_full=True):
+            for n in range(tBpB_residue_k.shape[1], unroll_full=True):
+                for k in range(tBpB_residue_k.shape[2], unroll_full=True):
                     coord_B = tBcB[(0, rest_v), n, k, 0]
                     tBpB_residue_k[rest_v, n, k] = cute.elem_less(
                         (coord_B[0], cutlass.Int32(-1)), (mB.shape[0], coord_B[1])
@@ -445,7 +445,7 @@ class SGemm:
             gmem_pipe_read + 1 if gmem_pipe_read + 1 < k_tile_count else cutlass.Int32(0)
         )
         # Start async loads for 1st k-tile onwards, no k-residue handling needed
-        for k_tile in range(1, k_pipe_max - 1):
+        for k_tile in range(1, k_pipe_max - 1, unroll_full=True):
             if k_tile < k_tile_count:
                 cute.copy(
                     tiled_copy_A,
@@ -468,11 +468,11 @@ class SGemm:
         # all tiles have been copied from global memory, so clear the
         # predicate tensor
         if k_tile_count < k_pipe_max:
-            for rest_v in range(tApA.shape[0]):
-                for m in range(tApA.shape[1]):
+            for rest_v in range(tApA.shape[0], unroll_full=True):
+                for m in range(tApA.shape[1], unroll_full=True):
                     tApA[rest_v, m, 0] = cutlass.Boolean(0)
-            for rest_v in range(tBpB.shape[0]):
-                for n in range(tBpB.shape[1]):
+            for rest_v in range(tBpB.shape[0], unroll_full=True):
+                for n in range(tBpB.shape[1], unroll_full=True):
                     tBpB[rest_v, n, 0] = cutlass.Boolean(0)
 
         # ///////////////////////////////////////////////////////////////////////////////
@@ -614,7 +614,7 @@ class SGemm:
         predC = cute.make_fragment(tCrC.layout, cutlass.Boolean)
         residue_m = mC.shape[0] - cutlass.Int32(self._bM) * bidx
         residue_n = mC.shape[1] - cutlass.Int32(self._bN) * bidy
-        for i in range(cute.size(tCrC.shape)):
+        for i in range(cute.size(tCrC.shape), unroll_full=True):
             predC[i] = cute.elem_less(tCpC[i], (residue_m, residue_n))
         numIterM = cute.size(tCrC, mode=[1])
         numIterN = cute.size(tCrC, mode=[2])
@@ -829,6 +829,7 @@ if __name__ == "__main__":
         default=False,
         help="Use circular buffer tensor sets to ensure L2 cold cache",
     )
+    parser.add_argument("--static_shape", action="store_true", default=False)
 
     args = parser.parse_args()
     print("Running SIMT GEMM example:")
