@@ -125,8 +125,12 @@ class SGemm:
 
         padding_a = 4 if self.a_major_mode == utils.LayoutEnum.ROW_MAJOR else 0
         padding_b = 4 if self.b_major_mode == utils.LayoutEnum.ROW_MAJOR else 0
-        sA_layout = cute.make_layout(
-            (self._bM, self._bK, self._num_stages),
+        sA_layout = cute.make_layout(  # 这里是按照一个block tile来计算的，猜测是因为shared memory在一个block内部是共享的
+            (
+                self._bM,
+                self._bK,
+                self._num_stages,
+            ),  # 在共享内存中循环使用多少个 tile buffer 来做数据流水线
             stride=(1, (self._bM + padding_a), self._bK * (self._bM + padding_a)),
         )
         sB_layout = cute.make_layout(
@@ -166,18 +170,24 @@ class SGemm:
         )
 
         if cutlass.const_expr(self.a_major_mode == utils.LayoutEnum.COL_MAJOR):
-            num_vectorized = 4 if (mA.layout.max_alignment % 16 == 0) else 1
+            num_vectorized = (
+                4 if (mA.layout.max_alignment % 16 == 0) else 1
+            )  # 16 bytes alignment, it means if 128bit alignment, use vectorized copy
             atom_async_copy_A = cute.make_copy_atom(
                 cute.nvgpu.cpasync.CopyG2SOp(),
                 mA.element_type,
                 num_bits_per_copy=mA.element_type.width * num_vectorized,
             )
+            # major_mode_size 表示沿 主方向（major mode）一次能分成的 线程组大小（把向量化个数考虑进去）
             major_mode_size = self._bM // num_vectorized
             tA = cute.make_layout(
-                (major_mode_size, self._num_threads // major_mode_size),
+                (
+                    major_mode_size,
+                    self._num_threads // major_mode_size,
+                ),  # 在主方向上由于需要向量化，因此Major_mode_size就是主方向上可以容纳的线程数，其余block内部的线程都分配到另一个方向上去
                 stride=(1, major_mode_size),
             )
-            vA = cute.make_layout((num_vectorized, 1))
+            vA = cute.make_layout((num_vectorized, 1))  # 每个线程处理的元素个数
 
         if cutlass.const_expr(self.b_major_mode == utils.LayoutEnum.COL_MAJOR):
             num_vectorized = 4 if (mB.layout.max_alignment % 16 == 0) else 1
@@ -216,9 +226,20 @@ class SGemm:
         #   - (with permutation) ==>
         #      0 0 0 0 1 1 1 1 2 2 2 2 ... 15 15 15 15 0 0 0 0 1 1 1 1 ......
         # ///////////////////////////////////////////////////////////////////////////////
-        atoms_layout = cute.make_layout((self._num_threads // 16, 16, 1), stride=(16, 1, 0))
+
+        # 这里 "MMA atom" 可以理解为 MMA 运算的最小单元（比如 tensor core 里一个 warp 执行的 16×8×8 矩阵相乘累加），但在这里他们用的是 MmaUniversalOp，MMA trait 是 1×1×1（没有特别的块结构），所以这个 "atom" 实际上和线程 ≈ 一一对应。
+        # atoms_layout = 表示M N K方向上分别重复几次Atom
+        # permutation_tiler_M/N：规定了 这一组线程内部，每个线程一次取几个连续数据到 REG
+        # tiled_mma：整体表达了矩阵在MNK空间维度如何通过Atom组织而来
+
+        # mma.sync.m16n8k8这类指令，执行单位是一个warp，似乎去看官方的ptx指令表就会发现一个warp可能的线程排布就是 16x2 的形式，因此这里我们给一个16出来
+        atoms_layout = cute.make_layout(  # (m, n, k)，如果是行优先，那么这里就是在n上连续
+            (self._num_threads // 16, 16, 1), stride=(16, 1, 0)
+        )
         if cutlass.const_expr(self.c_major_mode == utils.LayoutEnum.COL_MAJOR):
-            atoms_layout = cute.make_layout((16, self._num_threads // 16, 1), stride=(1, 16, 0))
+            atoms_layout = cute.make_layout(  # (m, n, k)，如果是列优先，那么这里就是在m上连续
+                (16, self._num_threads // 16, 1), stride=(1, 16, 0)
+            )
         op = cute.nvgpu.MmaUniversalOp(cutlass.Float32)
         permutation_tiler_M = cute.make_layout((atoms_layout.shape[0], 4), stride=(4, 1))
         permutation_tiler_N = cute.make_layout((atoms_layout.shape[1], 4), stride=(4, 1))
