@@ -68,6 +68,8 @@ To run this example:
       --mnk 8192,8192,8192                                \
       --a_major m --b_major n --c_major n
 
+    python3 cute_ops/ops/sgemm_official.py --mnk 128,128,16 --a_major m --b_major n --c_major n
+
 To collect performance with NCU profiler:
 
 .. code-block:: bash
@@ -124,7 +126,9 @@ class SGemm:
         # ///////////////////////////////////////////////////////////////////////////////
 
         padding_a = 4 if self.a_major_mode == utils.LayoutEnum.ROW_MAJOR else 0
-        padding_b = 4 if self.b_major_mode == utils.LayoutEnum.ROW_MAJOR else 0
+        padding_b = (
+            4 if self.b_major_mode == utils.LayoutEnum.ROW_MAJOR else 0
+        )  # 这里 padding_4 实际上刚好就是多了一个 float32 的空间，用来缓解 bank conflict
         sA_layout = cute.make_layout(  # 这里是按照一个block tile来计算的，猜测是因为shared memory在一个block内部是共享的
             (
                 self._bM,
@@ -154,9 +158,11 @@ class SGemm:
         #       defaults to a non-vectorized copy
         # ///////////////////////////////////////////////////////////////////////////////
 
-        tA = cute.make_layout((self._num_threads // self._bK, self._bK), stride=(self._bK, 1))
+        tA = cute.make_layout(
+            (self._num_threads // self._bK, self._bK), stride=(self._bK, 1)
+        )  # 在k维度每个线程处理一个元素，在另一个维度上分配剩余的线程
         tB = cute.make_layout((self._num_threads // self._bK, self._bK), stride=(self._bK, 1))
-        vA = cute.make_layout((1, 1))
+        vA = cute.make_layout((1, 1))  # 先初始化一个默认值，每个线程处理一个元素
         vB = cute.make_layout((1, 1))
         atom_async_copy_A = cute.make_copy_atom(
             cute.nvgpu.cpasync.CopyG2SOp(),
@@ -184,7 +190,7 @@ class SGemm:
                 (
                     major_mode_size,
                     self._num_threads // major_mode_size,
-                ),  # 在主方向上由于需要向量化，因此Major_mode_size就是主方向上可以容纳的线程数，其余block内部的线程都分配到另一个方向上去
+                ),  # 在主方向上由于需要向量化，因此Major_mode_size就是主方向上可以容纳的线程数，其余block内部的线程都分配到另一个方向上去。感觉如果比bK小的话应该是要循环的
                 stride=(1, major_mode_size),
             )
             vA = cute.make_layout((num_vectorized, 1))  # 每个线程处理的元素个数
@@ -240,8 +246,12 @@ class SGemm:
             atoms_layout = cute.make_layout(  # (m, n, k)，如果是列优先，那么这里就是在m上连续
                 (16, self._num_threads // 16, 1), stride=(1, 16, 0)
             )
-        op = cute.nvgpu.MmaUniversalOp(cutlass.Float32)
-        permutation_tiler_M = cute.make_layout((atoms_layout.shape[0], 4), stride=(4, 1))
+        op = cute.nvgpu.MmaUniversalOp(
+            cutlass.Float32
+        )  # `MmaUniversalOp` 就是个 1x1x1 的 MMA trait
+        permutation_tiler_M = cute.make_layout(
+            (atoms_layout.shape[0], 4), stride=(4, 1)
+        )  # 这个应该怎么理解啊？
         permutation_tiler_N = cute.make_layout((atoms_layout.shape[1], 4), stride=(4, 1))
         tiled_mma = cute.make_tiled_mma(
             op,
@@ -295,6 +305,7 @@ class SGemm:
         gA = cute.local_tile(mA, tiler=self._cta_tiler, coord=tiler_coord, proj=(1, None, 1))
         gB = cute.local_tile(mB, tiler=self._cta_tiler, coord=tiler_coord, proj=(None, 1, 1))
         gC = cute.local_tile(mC, tiler=self._cta_tiler, coord=tiler_coord, proj=(1, 1, None))
+        # sA shape (128,8,3), gA shape (128,8,2)
 
         # Move the pointer of gA/gB in the `-k`` direction, making the first
         # tile (instead of the last one) irregular in shape when k is irregular.
@@ -312,12 +323,15 @@ class SGemm:
         # ///////////////////////////////////////////////////////////////////////////////
         # Create shared memory buffer
         smem = cutlass.utils.SmemAllocator()
-        sA = smem.allocate_tensor(mA.element_type, sA_layout, 16)
+        sA = smem.allocate_tensor(
+            mA.element_type, sA_layout, 16
+        )  # 使用layout分配shared memory，这里16字节对齐，应该就是为了128bit，对齐向量拷贝指令
         sB = smem.allocate_tensor(mB.element_type, sB_layout, 16)
         thr_copy_A = tiled_copy_A.get_slice(tidx)
         thr_copy_B = tiled_copy_B.get_slice(tidx)
         tAgA = thr_copy_A.partition_S(gA)
         tAsA = thr_copy_A.partition_D(sA)
+        # tAgA shape ((4,1),1,1,2), tAsA shape ((4,1),1,1,3)
         tBgB = thr_copy_B.partition_S(gB)
         tBsB = thr_copy_B.partition_D(sB)
 
@@ -334,6 +348,8 @@ class SGemm:
         # CPY =  (atom_v, rest_v)
         # ///////////////////////////////////////////////////////////////////////////////
         # Construct identity layout for sA and sB, used for predication
+        # 这一部分看不懂一点
+        # 这里就是构建坐标来处理边界问题的，c 我猜是 coord 的意思，identity tensor 就是每个位置的坐标值
         mcA = cute.make_identity_tensor(mA.shape)
         mcB = cute.make_identity_tensor(mB.shape)
         cA = cute.local_tile(mcA, tiler=self._cta_tiler, coord=tiler_coord, proj=(1, None, 1))
@@ -344,14 +360,17 @@ class SGemm:
         tAcA = thr_copy_A.partition_S(cA)
         tBcB = thr_copy_B.partition_S(cB)
         # Allocate predicate tensors for m and n
+        # 其实会发现，tApA里面每一个维度都是一个循环
         tApA = cute.make_fragment(
             cute.make_layout(
                 (
+                    # 因为rest_v代表了调用atom_v的次数，其实也是一个循环，
+                    # 因此也需要表示在这个循环下的一个mask，毕竟有可能第一个循环数据都没问题，第二个循环有的数据坐标越界
                     tAsA.shape[0][1],
-                    cute.size(tAsA, mode=[1]),
-                    cute.size(tAsA, mode=[2]),
+                    cute.size(tAsA, mode=[1]),  # CPY_M
+                    cute.size(tAsA, mode=[2]),  # CPY_K
                 ),
-                stride=(cute.size(tAsA, mode=[1]), 1, 0),
+                stride=(cute.size(tAsA, mode=[1]), 1, 0),  # CPY_M, 1, 0
             ),
             cutlass.Boolean,
         )
@@ -371,12 +390,12 @@ class SGemm:
             cute.make_layout(
                 (
                     tAsA.shape[0][1],
-                    cute.size(tAsA, mode=[1]),
-                    cute.size(tAsA, mode=[2]),
+                    cute.size(tAsA, mode=[1]),  # CPY_M
+                    cute.size(tAsA, mode=[2]),  # CPY_K
                 ),
                 stride=(
-                    cute.size(tAsA, mode=[1]) * cute.size(tAsA, mode=[2]),
-                    cute.size(tAsA, mode=[2]),
+                    cute.size(tAsA, mode=[1]) * cute.size(tAsA, mode=[2]),  # CPY_M * CPY_K
+                    cute.size(tAsA, mode=[2]),  # CPY_K
                     1,
                 ),
             ),
@@ -400,6 +419,7 @@ class SGemm:
         # Set predicates for m/n bounds for mainloop
         for rest_v in range(tApA.shape[0], unroll_full=True):
             for m in range(tApA.shape[1], unroll_full=True):
+                # tAcA shape (CPY, CPY_M, CPY_K, k)
                 tApA[rest_v, m, 0] = cute.elem_less(tAcA[(0, rest_v), m, 0, 0][0], mA.shape[0])
         for rest_v in range(tBpB.shape[0], unroll_full=True):
             for n in range(tBpB.shape[1], unroll_full=True):
@@ -409,9 +429,13 @@ class SGemm:
         for rest_v in range(tApA_residue_k.shape[0], unroll_full=True):
             for m in range(tApA_residue_k.shape[1], unroll_full=True):
                 for k in range(tApA_residue_k.shape[2], unroll_full=True):
-                    coord_A = tAcA[(0, rest_v), m, k, 0]
+                    coord_A = tAcA[(0, rest_v), m, k, 0]  # 这里最后为什么是0
                     tApA_residue_k[rest_v, m, k] = cute.elem_less(
-                        (coord_A[0], cutlass.Int32(-1)), (mA.shape[0], coord_A[1])
+                        (coord_A[0], cutlass.Int32(-1)),
+                        (
+                            mA.shape[0],
+                            coord_A[1],
+                        ),  # 然后k方向的越界检查为什么一直是-1，这不是相当于k方向根本就不做检查
                     )
         for rest_v in range(tBpB_residue_k.shape[0], unroll_full=True):
             for n in range(tBpB_residue_k.shape[1], unroll_full=True):
@@ -440,7 +464,7 @@ class SGemm:
             tBsB[None, None, None, 0],
             pred=tBpB_residue_k,
         )
-        cute.arch.cp_async_commit_group()
+        cute.arch.cp_async_commit_group()  # 异步拷贝需要使用该指令提交后硬件才会真正开始执行，commit_group 像是告诉 DMA / 拷贝单元：这组指令已发完，可以并行去搬运了
         gmem_pipe_read = (
             gmem_pipe_read + 1 if gmem_pipe_read + 1 < k_tile_count else cutlass.Int32(0)
         )
@@ -556,6 +580,7 @@ class SGemm:
                 # compute instructions, we intentionally use the sequence:
                 # copy A, perform GEMM, then copy B.
                 if k_block == 0:
+                    # 注意这里读取的是下一个 k_tile，而不是下一个 k_block
                     cute.copy(
                         tiled_copy_A,
                         tAgA[None, None, None, gmem_pipe_read],
